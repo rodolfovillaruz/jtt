@@ -10,6 +10,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use terminal_size::{terminal_size, Width};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -40,54 +41,77 @@ fn term_width() -> usize {
     }
 }
 
-fn char_len(s: &str) -> usize {
-    s.chars().count()
+/// Returns the number of **terminal columns** a string occupies.
+/// Emoji and CJK characters count as 2; control chars as 0.
+fn display_width(s: &str) -> usize {
+    s.width()
 }
 
+/// Pad `s` to exactly `width` **columns** with trailing spaces.
 fn pad_right(s: &str, width: usize) -> String {
-    let len = char_len(s);
-    if len >= width {
+    let w = display_width(s);
+    if w >= width {
         s.to_string()
     } else {
-        let mut out = String::from(s);
-        out.push_str(&" ".repeat(width - len));
+        let mut out = s.to_string();
+        out.push_str(&" ".repeat(width - w));
         out
     }
 }
 
-fn take_chars(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
+/// Take characters from `s` until the accumulated column count would exceed `cols`.
+/// Stops before a wide character that would overflow.
+fn take_cols(s: &str, cols: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > cols {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
 }
 
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
+/// Word-wrap `text` so that no line exceeds `cols` **terminal columns**.
+fn wrap(text: &str, cols: usize) -> Vec<String> {
+    let cols = cols.max(1);
+    let mut lines: Vec<String> = Vec::new();
 
     for para in text.split('\n') {
-        let mut chars: Vec<char> = para.chars().collect();
+        let mut remaining = para;
 
-        while chars.len() > width {
-            let upper = width.min(chars.len().saturating_sub(1));
-            let mut split: Option<usize> = None;
-            for i in (0..=upper).rev() {
-                if chars[i] == ' ' {
-                    split = Some(i);
+        loop {
+            if display_width(remaining) <= cols {
+                lines.push(remaining.to_string());
+                break;
+            }
+
+            // Walk forward, tracking column position.
+            // Record the byte index of the last space that still fits.
+            let mut col: usize = 0;
+            let mut last_space: Option<usize> = None; // byte index of space
+            let mut hard_cut: usize = remaining.len(); // fallback: cut here
+
+            for (byte_idx, ch) in remaining.char_indices() {
+                let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if col + ch_w > cols {
+                    hard_cut = byte_idx;
                     break;
                 }
+                if ch == ' ' {
+                    last_space = Some(byte_idx);
+                }
+                col += ch_w;
             }
-            let split_idx = split.unwrap_or(width);
 
-            let first: String = chars[..split_idx].iter().collect();
-            lines.push(first.trim_end().to_string());
+            let split_at = last_space.unwrap_or(hard_cut);
 
-            let mut rest_start = split_idx;
-            while rest_start < chars.len() && chars[rest_start].is_whitespace() {
-                rest_start += 1;
-            }
-            chars = chars[rest_start..].to_vec();
+            lines.push(remaining[..split_at].trim_end().to_string());
+            remaining = remaining[split_at..].trim_start_matches(' ');
         }
-
-        lines.push(chars.iter().collect());
     }
 
     lines
@@ -117,30 +141,36 @@ fn json_to_pretty_chat(data: &[Turn]) -> String {
 
         let (side, max_outer) = match role.as_str() {
             "user" => ("right", bubble_max_width),
-            "assistant" => ("left", bubble_max_width),
             "system" => ("full", width),
             _ => ("left", bubble_max_width),
         };
 
+        // ╭──…──╮  →  2 border chars + 2 spaces + inner
         let max_inner_possible = if max_outer > 4 { max_outer - 4 } else { 1 };
 
+        // Truncate label if it is too wide.
         let mut display_label = label.to_string();
-        if char_len(&display_label) > max_inner_possible {
-            let keep = max_inner_possible.saturating_sub(1);
-            display_label = format!("{}…", take_chars(&display_label, keep));
+        if display_width(&display_label) > max_inner_possible {
+            let keep = max_inner_possible.saturating_sub(1); // leave room for "…"
+            display_label = format!("{}…", take_cols(&display_label, keep));
         }
 
         let wrapped_body = wrap(&body, max_inner_possible);
 
-        let body_max_len = wrapped_body.iter().map(|l| char_len(l)).max().unwrap_or(0);
-        let mut inner_width = char_len(&display_label).max(body_max_len);
+        // Inner width = widest of (label, body lines), capped at max_inner_possible.
+        let body_max = wrapped_body
+            .iter()
+            .map(|l| display_width(l))
+            .max()
+            .unwrap_or(0);
+        let mut inner_width = display_width(&display_label).max(body_max);
 
         let mut w = inner_width + 4;
         if w > max_outer {
             inner_width = max_outer.saturating_sub(4);
             w = max_outer;
-            if char_len(&display_label) > inner_width {
-                display_label = take_chars(&display_label, inner_width);
+            if display_width(&display_label) > inner_width {
+                display_label = take_cols(&display_label, inner_width);
             }
         }
 
@@ -185,17 +215,6 @@ fn load_json(path: &PathBuf) -> Result<Vec<Turn>, Box<dyn std::error::Error>> {
 
 // ─── Ratatui pager ───────────────────────────────────────────────────────────
 
-/// Full-screen, keyboard-driven pager backed by ratatui + crossterm.
-///
-/// Keys
-/// ────
-/// q / Q / Ctrl-C        quit
-/// ↓  j  Enter           scroll one line down
-/// ↑  k                  scroll one line up
-/// PgDn  Space  f        scroll one page down
-/// PgUp  b               scroll one page up
-/// g  Home               jump to top
-/// G  End                jump to bottom
 fn ratatui_page(text: &str) {
     use crossterm::{
         event::{self, Event, KeyCode, KeyModifiers},
@@ -212,53 +231,43 @@ fn ratatui_page(text: &str) {
     };
     use std::io::stdout;
 
-    // ── Pre-process text into lines ──────────────────────────────────────────
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
     let mut offset: usize = 0;
 
-    // ── Terminal setup ───────────────────────────────────────────────────────
     terminal::enable_raw_mode().expect("enable raw mode");
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen).expect("enter alternate screen");
     let mut terminal =
         Terminal::new(CrosstermBackend::new(stdout)).expect("create ratatui terminal");
 
-    // ── Event loop ───────────────────────────────────────────────────────────
     loop {
-        // Draw one frame.
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                let total_h = area.height as usize;
-                let ph = total_h.saturating_sub(1); // rows available for content
+                let ph = (area.height as usize).saturating_sub(1);
                 let end = (offset + ph).min(total);
 
-                // ── Content pane ─────────────────────────────────────────────
                 let content_rect = Rect {
                     x: area.x,
                     y: area.y,
                     width: area.width,
                     height: area.height.saturating_sub(1),
                 };
-
                 let visible = Text::from(
                     lines[offset..end]
                         .iter()
                         .map(|l| Line::raw(*l))
                         .collect::<Vec<_>>(),
                 );
-                // No ratatui-level wrapping: the text is already pre-wrapped.
                 frame.render_widget(Paragraph::new(visible), content_rect);
 
-                // ── Status bar ────────────────────────────────────────────────
                 let status_rect = Rect {
                     x: area.x,
                     y: area.y + area.height.saturating_sub(1),
                     width: area.width,
                     height: 1,
                 };
-
                 let pct = if total == 0 { 100 } else { end * 100 / total };
                 let status = format!(
                     " {first}–{last}/{total} ({pct}%){end_marker}\
@@ -270,74 +279,51 @@ fn ratatui_page(text: &str) {
                     pct = pct,
                     end_marker = if end >= total { " END " } else { " " },
                 );
-
                 let bar =
                     Paragraph::new(status).style(Style::default().add_modifier(Modifier::REVERSED));
                 frame.render_widget(bar, status_rect);
             })
             .expect("draw frame");
 
-        // Process one input event.
         match event::read().expect("read event") {
             Event::Key(key) => {
-                // Recalculate page height from the live terminal size.
                 let ph = terminal
                     .size()
                     .map(|s| (s.height as usize).saturating_sub(1))
                     .unwrap_or(23);
 
                 match key.code {
-                    // ── Quit ─────────────────────────────────────────────────
                     KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        break;
-                    }
-
-                    // ── One line down ─────────────────────────────────────────
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => {
                         if offset + ph < total {
                             offset += 1;
                         }
                     }
-
-                    // ── One line up ───────────────────────────────────────────
                     KeyCode::Up | KeyCode::Char('k') => {
                         offset = offset.saturating_sub(1);
                     }
-
-                    // ── One page down ─────────────────────────────────────────
                     KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
                         offset = (offset + ph).min(total.saturating_sub(ph));
                     }
-
-                    // ── One page up ───────────────────────────────────────────
                     KeyCode::PageUp | KeyCode::Char('b') => {
                         offset = offset.saturating_sub(ph);
                     }
-
-                    // ── Jump to top ───────────────────────────────────────────
                     KeyCode::Home | KeyCode::Char('g') => offset = 0,
-
-                    // ── Jump to bottom ────────────────────────────────────────
                     KeyCode::End | KeyCode::Char('G') => {
                         offset = total.saturating_sub(ph);
                     }
-
-                    _ => {} // unknown key: just redraw on next iteration
+                    _ => {}
                 }
             }
-
-            // Keep the offset sane when the window is resized.
             Event::Resize(_, h) => {
                 let ph = (h as usize).saturating_sub(1);
                 offset = offset.min(total.saturating_sub(ph));
             }
-
             _ => {}
         }
     }
 
-    // ── Tear down ────────────────────────────────────────────────────────────
     terminal::disable_raw_mode().expect("disable raw mode");
     execute!(terminal.backend_mut(), LeaveAlternateScreen).expect("leave alternate screen");
     terminal.show_cursor().expect("show cursor");
@@ -346,7 +332,6 @@ fn ratatui_page(text: &str) {
 // ─── Output dispatcher ───────────────────────────────────────────────────────
 
 fn page_output(text: &str) {
-    // When stdout is a pipe or file, just print directly.
     if !std::io::stdout().is_terminal() {
         print!("{}", text);
         return;
