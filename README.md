@@ -1,30 +1,25 @@
-# jtt — JSON Talk Terminal
+# jtt
 
-Pretty-print a JSON chat log as styled terminal bubbles, right-aligned for
-`user`, left-aligned for `assistant`, and full-width for `system` messages.
-Bubbles are capped at 75 % of the terminal width so long conversations remain
-readable at a glance.
+**Pretty-print JSON chat logs as left/right terminal bubbles with a built-in pager.**
 
-Output is sent through your `$PAGER` (falling back to `less -R`, then `more`,
-then a built-in interactive pager) when stdout is a terminal, or piped
-straight through when it is not.
+[![Crates.io](https://img.shields.io/crates/v/jtt)](https://crates.io/crates/jtt)
+[![License: MIT](https://img.shields.io/crates/l/jtt)](https://crates.io/crates/jtt)
 
-```
-╭─────────────────────────────────────────────╮          ╭────────────────────────╮
-│ Assistant                                   │          │ You                    │
-├─────────────────────────────────────────────┤          ├────────────────────────┤
-│ Sure! Rust ownership means every value has  │          │ Can you explain Rust   │
-│ exactly one owner at a time.  When the      │          │ ownership briefly?     │
-│ owner goes out of scope the value is        │          ╰────────────────────────╯
-│ dropped automatically — no GC required.     │
-╰─────────────────────────────────────────────╯
-```
+## What is this?
 
----
+`jtt` is a terminal viewer for JSON conversation files. It renders each message
+as a Unicode-bordered bubble — user messages float to the right, assistant
+messages to the left, system messages span the full width — and opens the result
+in a keyboard-driven, full-screen pager so you can scroll through long
+conversations without losing context.
+
+It pairs naturally with [raw-llm](https://github.com/rodolfovillaruz/raw-llm),
+which stores every conversation as a plain JSON file in exactly the format `jtt`
+expects.
 
 ## Installation
 
-### From crates.io
+### From [crates.io](https://crates.io/crates/jtt)
 
 ```bash
 cargo install jtt
@@ -33,81 +28,107 @@ cargo install jtt
 ### From source
 
 ```bash
-git clone https://github.com/rodolfovillaruz/jtt
+git clone https://github.com/rodolfovillaruz/jtt.git
 cd jtt
 cargo install --path .
 ```
 
----
-
 ## Usage
 
-```
-jtt <input>
+```bash
+jtt path/to/conversation.json
 ```
 
-| Argument | Description                  |
-|----------|------------------------------|
-| `input`  | Path to a JSON chat file     |
-
-### Examples
+`jtt` reads the file, wraps every message to 75 % of your terminal width, and
+opens the built-in pager. When stdout is redirected to a pipe or file the pager
+is skipped and the rendered text is written directly.
 
 ```bash
-# View a chat file
-jtt conversation.json
-
-# Pipe to a file
-jtt conversation.json > chat.txt
-
-# Use a custom pager
-PAGER=bat jtt conversation.json
+# Pipe the rendered output to a file
+jtt conversation.json > conversation.txt
 ```
 
----
+### Pager key bindings
 
-## Input format
+| Key                        | Action            |
+| -------------------------- | ----------------- |
+| `q` / `Q` / `Ctrl-C`       | Quit              |
+| `↓` / `j` / `Enter`        | One line down     |
+| `↑` / `k`                  | One line up       |
+| `PgDn` / `Space` / `f`     | One page down     |
+| `PgUp` / `b`               | One page up       |
+| `g` / `Home`               | Jump to top       |
+| `G` / `End`                | Jump to bottom    |
 
-The JSON file must be either a **single object** or an **array of objects**.
-Each object may carry the following fields:
+## Conversation format
 
-| Field     | Type   | Required | Description                                      |
-|-----------|--------|----------|--------------------------------------------------|
-| `role`    | string | yes      | `"user"`, `"assistant"`, or `"system"`           |
-| `content` | string | yes      | The message text (newlines and tabs are handled) |
-
-### Array format (typical)
+`jtt` reads JSON files that are either a single message object or an array of
+message objects. Each object needs a `role` and a `content` field:
 
 ```json
 [
   { "role": "system",    "content": "You are a helpful assistant." },
-  { "role": "user",      "content": "Hello!" },
-  { "role": "assistant", "content": "Hi there! How can I help you today?" }
+  { "role": "user",      "content": "What is context engineering?" },
+  { "role": "assistant", "content": "Context engineering is the practice of …" }
 ]
 ```
 
-### Single-object format
+| `role`      | Bubble position        |
+| ----------- | ---------------------- |
+| `user`      | Right (75 % width)     |
+| `assistant` | Left  (75 % width)     |
+| `system`    | Full terminal width    |
+| anything else | Left (75 % width)   |
 
-```json
-{ "role": "user", "content": "Just one message." }
+## Using with raw-llm
+
+[raw-llm](https://github.com/rodolfovillaruz/raw-llm) saves every conversation
+as a JSON array in the same format `jtt` expects. The two tools compose
+naturally over a shared file.
+
+### Start a conversation, then view it
+
+```bash
+# Start a new conversation with Claude
+echo "Explain monads in one paragraph" | claude .prompt/monads.json
+
+# View the conversation as chat bubbles
+jtt .prompt/monads.json
 ```
 
----
+### Continue a conversation, then view it
 
-## Built-in pager keys
+```bash
+# Add another turn to an existing conversation
+echo "Give me a concrete Haskell example" | claude .prompt/monads.json
 
-Invoked automatically when no external pager is found.
+# Review the full exchange
+jtt .prompt/monads.json
+```
 
-| Key                        | Action              |
-|----------------------------|---------------------|
-| `q` / `Q` / `Ctrl-C`       | Quit                |
-| `↓` / `j` / `Enter`        | Scroll one line down |
-| `↑` / `k`                  | Scroll one line up  |
-| `PgDn` / `Space` / `f`     | Scroll one page down |
-| `PgUp` / `b`               | Scroll one page up  |
-| `g` / `Home`               | Jump to top         |
-| `G` / `End`                | Jump to bottom      |
+### Pipe the rendered output
 
----
+```bash
+# Render to plain text for sharing or archiving
+jtt .prompt/monads.json > monads.txt
+```
+
+### Typical workflow
+
+```bash
+# 1 · Ask a question
+echo "Refactor this function" | cat main.rs - | claude .prompt/refactor.json
+
+# 2 · Review the answer in the pager
+jtt .prompt/refactor.json
+
+# 3 · Edit the conversation file to steer context, then continue
+$EDITOR .prompt/refactor.json
+echo "Now add error handling" | claude .prompt/refactor.json
+
+# 4 · Review the updated exchange
+jtt .prompt/refactor.json
+```
 
 ## License
 
