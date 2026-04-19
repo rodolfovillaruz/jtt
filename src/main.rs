@@ -182,23 +182,79 @@ fn load_json(path: &PathBuf) -> Result<Vec<Turn>, Box<dyn std::error::Error>> {
 
 fn page_output(text: &str) {
     if !std::io::stdout().is_terminal() {
-        println!("{}", text);
+        print!("{}", text);
         return;
     }
-
-    let pager = minus::Pager::new();
-    if pager.push_str(text).is_err() {
-        println!("{}", text);
+    if try_spawn_pager(text) {
         return;
     }
-    // Scroll to bottom on launch, like `less +G`.
-    let _ = pager.follow_output(true);
-
-    if minus::page_all(pager).is_err() {
-        println!("{}", text);
-    }
+    builtin_page(text);
 }
 
+/// Try each external pager in priority order.
+/// Returns true if one was successfully spawned and finished.
+fn try_spawn_pager(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // (executable, extra_args)
+    // less  — Unix, Git-for-Windows, Scoop/Chocolatey, etc.
+    //         -R keeps ANSI colour codes intact.
+    // more  — built-in on both Windows (more.com) and Unix.
+    //         Does not understand -R, so no extra flags.
+    let mut candidates: Vec<(String, Vec<&'static str>)> = Vec::new();
+
+    if let Ok(p) = std::env::var("PAGER") {
+        // Honour whatever the user set; no extra flags assumed.
+        candidates.push((p, vec![]));
+    }
+    candidates.push(("less".into(), vec!["-R"]));
+    candidates.push(("more".into(), vec![]));
+
+    for (prog, flags) in &candidates {
+        let mut cmd = Command::new(prog);
+        cmd.args(flags).stdin(Stdio::piped());
+
+        if let Ok(mut child) = cmd.spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                // Ignore broken-pipe: user may have quit the pager early.
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+            return true;
+        }
+    }
+    false
+}
+
+/// Simple built-in fallback: page by terminal height, prompt between pages.
+fn builtin_page(text: &str) {
+    use std::io::{BufRead, Write};
+
+    let page_size = terminal_size()
+        .map(|(_, terminal_size::Height(h))| h as usize)
+        .unwrap_or(24)
+        .saturating_sub(1); // one line reserved for the prompt
+
+    let mut printed = 0usize;
+
+    for line in text.lines() {
+        println!("{}", line);
+        printed += 1;
+
+        if printed % page_size == 0 {
+            print!("--- more --- (Enter to continue, q + Enter to quit) ");
+            let _ = std::io::stdout().flush();
+
+            let mut input = String::new();
+            let _ = std::io::stdin().lock().read_line(&mut input);
+
+            if input.trim().eq_ignore_ascii_case("q") {
+                break;
+            }
+        }
+    }
+}
 fn main() -> ExitCode {
     let args = Args::parse();
     match load_json(&args.input) {
