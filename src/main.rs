@@ -11,12 +11,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use terminal_size::{terminal_size, Width};
 
+// ─── CLI ─────────────────────────────────────────────────────────────────────
+
 #[derive(Parser)]
 #[command(about = "Pretty-print JSON chat as 75 % bubbles.")]
 struct Args {
     /// Path to JSON chat file
     input: PathBuf,
 }
+
+// ─── Data model ──────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Debug)]
 struct Turn {
@@ -25,6 +29,8 @@ struct Turn {
     #[serde(default)]
     content: String,
 }
+
+// ─── Terminal helpers ─────────────────────────────────────────────────────────
 
 fn term_width() -> usize {
     if let Some((Width(w), _)) = terminal_size() {
@@ -86,6 +92,8 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
     lines
 }
+
+// ─── Chat renderer ───────────────────────────────────────────────────────────
 
 fn json_to_pretty_chat(data: &[Turn]) -> String {
     let user_label = "You";
@@ -163,6 +171,8 @@ fn json_to_pretty_chat(data: &[Turn]) -> String {
     lines.join("\n")
 }
 
+// ─── JSON loader ─────────────────────────────────────────────────────────────
+
 fn load_json(path: &PathBuf) -> Result<Vec<Turn>, Box<dyn std::error::Error>> {
     let raw = fs::read_to_string(path)?;
     let v: serde_json::Value = serde_json::from_str(&raw)?;
@@ -173,206 +183,178 @@ fn load_json(path: &PathBuf) -> Result<Vec<Turn>, Box<dyn std::error::Error>> {
     }
 }
 
-fn page_output(text: &str) {
-    if !std::io::stdout().is_terminal() {
-        print!("{}", text);
-        return;
-    }
-    if try_spawn_pager(text) {
-        return;
-    }
-    builtin_page(text);
-}
+// ─── Ratatui pager ───────────────────────────────────────────────────────────
 
-/// Try each external pager in priority order.
-/// Returns true if one was successfully spawned and finished.
-fn try_spawn_pager(text: &str) -> bool {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let mut candidates: Vec<(String, Vec<&'static str>)> = Vec::new();
-
-    if let Ok(p) = std::env::var("PAGER") {
-        candidates.push((p, vec![]));
-    }
-    candidates.push(("less".into(), vec!["-R"]));
-    candidates.push(("more".into(), vec![]));
-
-    for (prog, flags) in &candidates {
-        let mut cmd = Command::new(prog);
-        cmd.args(flags).stdin(Stdio::piped());
-
-        if let Ok(mut child) = cmd.spawn() {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-            return true;
-        }
-    }
-    false
-}
-
-// ─── built-in less-like pager ────────────────────────────────────────────────
-
-/// Render one screenful plus the status bar.
-/// `out` must already be in raw mode.
-fn page_draw(
-    out: &mut std::io::Stdout,
-    lines: &[&str],
-    offset: usize,
-    term_w: usize,
-    term_h: usize,
-) {
-    use crossterm::{
-        cursor, execute,
-        terminal::{Clear, ClearType},
-    };
-    use std::io::Write;
-
-    // Reserve the last row for the status bar.
-    let ph = term_h.saturating_sub(1);
-    let total = lines.len();
-    let end = (offset + ph).min(total);
-
-    execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0)).unwrap();
-
-    for line in &lines[offset..end] {
-        // Raw mode: \n does NOT imply \r, so we write \r\n explicitly.
-        write!(out, "{}\r\n", line).unwrap();
-    }
-
-    // ── Status bar ───────────────────────────────────────────────────────────
-    let pct = if total == 0 { 100 } else { end * 100 / total };
-    let at_end = end >= total;
-
-    let status = format!(
-        " {first}-{last}/{total} ({pct}%){end_marker}\
-         \u{2502} q:quit  \u{2191}\u{2193}/jk:line  PgUp/PgDn:page  g/G:top/bot ",
-        first = if total == 0 { 0 } else { offset + 1 },
-        last = end,
-        total = total,
-        pct = pct,
-        end_marker = if at_end { " END " } else { " " },
-    );
-
-    // Pad to terminal width, then hard-truncate so we never wrap.
-    let bar: String = format!("{:<width$}", status, width = term_w)
-        .chars()
-        .take(term_w)
-        .collect();
-
-    execute!(out, cursor::MoveTo(0, ph as u16)).unwrap();
-    // Reverse-video highlight for the status bar.
-    write!(out, "\x1b[7m{}\x1b[0m", bar).unwrap();
-
-    out.flush().unwrap();
-}
-
-/// Interactive less-like pager used when no external pager is available.
+/// Full-screen, keyboard-driven pager backed by ratatui + crossterm.
 ///
 /// Keys
 /// ────
-/// q / Q / Ctrl-C   quit
-/// ↓  j  Enter      scroll one line down
-/// ↑  k             scroll one line up
-/// PgDn  Space  f   scroll one page down
-/// PgUp  b           scroll one page up
-/// g  Home           jump to top
-/// G  End            jump to bottom
-fn builtin_page(text: &str) {
+/// q / Q / Ctrl-C        quit
+/// ↓  j  Enter           scroll one line down
+/// ↑  k                  scroll one line up
+/// PgDn  Space  f        scroll one page down
+/// PgUp  b               scroll one page up
+/// g  Home               jump to top
+/// G  End                jump to bottom
+fn ratatui_page(text: &str) {
     use crossterm::{
-        cursor,
         event::{self, Event, KeyCode, KeyModifiers},
         execute,
-        terminal::{self, ClearType},
+        terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
     };
-    use std::io::{stdout, Write};
+    use ratatui::{
+        backend::CrosstermBackend,
+        layout::Rect,
+        style::{Modifier, Style},
+        text::{Line, Text},
+        widgets::Paragraph,
+        Terminal,
+    };
+    use std::io::stdout;
 
+    // ── Pre-process text into lines ──────────────────────────────────────────
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
-
-    terminal::enable_raw_mode().expect("failed to enable raw mode");
-    let mut out = stdout();
-
-    let (mut term_w, mut term_h) = terminal::size().unwrap_or((80, 24));
     let mut offset: usize = 0;
 
-    page_draw(&mut out, &lines, offset, term_w as usize, term_h as usize);
+    // ── Terminal setup ───────────────────────────────────────────────────────
+    terminal::enable_raw_mode().expect("enable raw mode");
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen).expect("enter alternate screen");
+    let mut terminal =
+        Terminal::new(CrosstermBackend::new(stdout)).expect("create ratatui terminal");
 
+    // ── Event loop ───────────────────────────────────────────────────────────
     loop {
-        match event::read().unwrap() {
-            // ── keyboard ─────────────────────────────────────────────────────
+        // Draw one frame.
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let total_h = area.height as usize;
+                let ph = total_h.saturating_sub(1); // rows available for content
+                let end = (offset + ph).min(total);
+
+                // ── Content pane ─────────────────────────────────────────────
+                let content_rect = Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: area.width,
+                    height: area.height.saturating_sub(1),
+                };
+
+                let visible = Text::from(
+                    lines[offset..end]
+                        .iter()
+                        .map(|l| Line::raw(*l))
+                        .collect::<Vec<_>>(),
+                );
+                // No ratatui-level wrapping: the text is already pre-wrapped.
+                frame.render_widget(Paragraph::new(visible), content_rect);
+
+                // ── Status bar ────────────────────────────────────────────────
+                let status_rect = Rect {
+                    x: area.x,
+                    y: area.y + area.height.saturating_sub(1),
+                    width: area.width,
+                    height: 1,
+                };
+
+                let pct = if total == 0 { 100 } else { end * 100 / total };
+                let status = format!(
+                    " {first}–{last}/{total} ({pct}%){end_marker}\
+                     \u{2502} q:quit  \u{2191}\u{2193}/jk:line  \
+                     PgUp/PgDn:page  g/G:top/bot ",
+                    first = if total == 0 { 0 } else { offset + 1 },
+                    last = end,
+                    total = total,
+                    pct = pct,
+                    end_marker = if end >= total { " END " } else { " " },
+                );
+
+                let bar =
+                    Paragraph::new(status).style(Style::default().add_modifier(Modifier::REVERSED));
+                frame.render_widget(bar, status_rect);
+            })
+            .expect("draw frame");
+
+        // Process one input event.
+        match event::read().expect("read event") {
             Event::Key(key) => {
-                let ph = (term_h as usize).saturating_sub(1);
+                // Recalculate page height from the live terminal size.
+                let ph = terminal
+                    .size()
+                    .map(|s| (s.height as usize).saturating_sub(1))
+                    .unwrap_or(23);
 
                 match key.code {
-                    // Quit
+                    // ── Quit ─────────────────────────────────────────────────
                     KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break;
+                    }
 
-                    // Scroll one line down
+                    // ── One line down ─────────────────────────────────────────
                     KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => {
                         if offset + ph < total {
                             offset += 1;
                         }
                     }
 
-                    // Scroll one line up
+                    // ── One line up ───────────────────────────────────────────
                     KeyCode::Up | KeyCode::Char('k') => {
                         offset = offset.saturating_sub(1);
                     }
 
-                    // Scroll one page down
+                    // ── One page down ─────────────────────────────────────────
                     KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
-                        offset = offset.saturating_add(ph).min(total.saturating_sub(ph));
+                        offset = (offset + ph).min(total.saturating_sub(ph));
                     }
 
-                    // Scroll one page up
+                    // ── One page up ───────────────────────────────────────────
                     KeyCode::PageUp | KeyCode::Char('b') => {
                         offset = offset.saturating_sub(ph);
                     }
 
-                    // Jump to top
+                    // ── Jump to top ───────────────────────────────────────────
                     KeyCode::Home | KeyCode::Char('g') => offset = 0,
 
-                    // Jump to bottom
+                    // ── Jump to bottom ────────────────────────────────────────
                     KeyCode::End | KeyCode::Char('G') => {
                         offset = total.saturating_sub(ph);
                     }
 
-                    _ => continue, // unrecognised key → no redraw
+                    _ => {} // unknown key: just redraw on next iteration
                 }
-
-                page_draw(&mut out, &lines, offset, term_w as usize, term_h as usize);
             }
 
-            // ── terminal resize ───────────────────────────────────────────────
-            Event::Resize(w, h) => {
-                term_w = w;
-                term_h = h;
+            // Keep the offset sane when the window is resized.
+            Event::Resize(_, h) => {
                 let ph = (h as usize).saturating_sub(1);
-                // Keep offset sane after resize.
                 offset = offset.min(total.saturating_sub(ph));
-                page_draw(&mut out, &lines, offset, term_w as usize, term_h as usize);
             }
 
             _ => {}
         }
     }
 
-    // Restore terminal state and clear the screen before returning.
-    terminal::disable_raw_mode().expect("failed to disable raw mode");
-    execute!(
-        out,
-        crossterm::terminal::Clear(ClearType::All),
-        cursor::MoveTo(0, 0)
-    )
-    .unwrap();
-    out.flush().unwrap();
+    // ── Tear down ────────────────────────────────────────────────────────────
+    terminal::disable_raw_mode().expect("disable raw mode");
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).expect("leave alternate screen");
+    terminal.show_cursor().expect("show cursor");
 }
 
-// ─── entry point ─────────────────────────────────────────────────────────────
+// ─── Output dispatcher ───────────────────────────────────────────────────────
+
+fn page_output(text: &str) {
+    // When stdout is a pipe or file, just print directly.
+    if !std::io::stdout().is_terminal() {
+        print!("{}", text);
+        return;
+    }
+    ratatui_page(text);
+}
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() -> ExitCode {
     let args = Args::parse();
