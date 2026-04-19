@@ -225,8 +225,7 @@ fn page_draw(
     term_h: usize,
 ) {
     use crossterm::{
-        cursor,
-        execute,
+        cursor, execute,
         terminal::{Clear, ClearType},
     };
     use std::io::Write;
@@ -250,10 +249,10 @@ fn page_draw(
     let status = format!(
         " {first}-{last}/{total} ({pct}%){end_marker}\
          \u{2502} q:quit  \u{2191}\u{2193}/jk:line  PgUp/PgDn:page  g/G:top/bot ",
-        first     = if total == 0 { 0 } else { offset + 1 },
-        last      = end,
-        total     = total,
-        pct       = pct,
+        first = if total == 0 { 0 } else { offset + 1 },
+        last = end,
+        total = total,
+        pct = pct,
         end_marker = if at_end { " END " } else { " " },
     );
 
@@ -310,11 +309,7 @@ fn builtin_page(text: &str) {
                 match key.code {
                     // Quit
                     KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                    KeyCode::Char('c')
-                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        break
-                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
 
                     // Scroll one line down
                     KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => {
@@ -330,9 +325,7 @@ fn builtin_page(text: &str) {
 
                     // Scroll one page down
                     KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
-                        offset = offset
-                            .saturating_add(ph)
-                            .min(total.saturating_sub(ph));
+                        offset = offset.saturating_add(ph).min(total.saturating_sub(ph));
                     }
 
                     // Scroll one page up
@@ -370,8 +363,12 @@ fn builtin_page(text: &str) {
 
     // Restore terminal state and clear the screen before returning.
     terminal::disable_raw_mode().expect("failed to disable raw mode");
-    execute!(out, ClearType::All, cursor::MoveTo(0, 0)).ok();
-    execute!(out, crossterm::terminal::Clear(ClearType::All), cursor::MoveTo(0, 0)).unwrap();
+    execute!(
+        out,
+        crossterm::terminal::Clear(ClearType::All),
+        cursor::MoveTo(0, 0)
+    )
+    .unwrap();
     out.flush().unwrap();
 }
 
