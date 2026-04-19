@@ -1,12 +1,19 @@
 [package]
-name = "jtt"
-version = "0.1.0"
-edition = "2021"
-exclude = [".dump/"]
+name        = "jtt"
+version     = "0.1.0"
+edition     = "2021"
+description = "Pretty-print JSON chat logs as left/right terminal bubbles with a built-in pager."
+license     = "MIT"
+readme      = "README.md"
+repository  = "https://github.com/rodolfovillaruz/jtt"
+homepage    = "https://github.com/rodolfovillaruz/jtt"
+keywords    = ["chat", "json", "terminal", "pretty-print", "cli"]
+categories  = ["command-line-utilities", "visualization"]
+exclude     = [".dump/", ".github/"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+clap          = { version = "4", features = ["derive"] }
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
 terminal_size = "0.4"
-crossterm  = "0.29"
+crossterm     = "0.29"
