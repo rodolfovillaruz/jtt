@@ -2,6 +2,7 @@
 name = "jtt"
 version = "0.1.0"
 edition = "2021"
+exclude = [".dump/"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
