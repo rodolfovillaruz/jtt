@@ -61,7 +61,6 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         let mut chars: Vec<char> = para.chars().collect();
 
         while chars.len() > width {
-            // Find the last space in chars[0..=width]  (Python: rfind(" ", 0, width+1))
             let upper = width.min(chars.len().saturating_sub(1));
             let mut split: Option<usize> = None;
             for i in (0..=upper).rev() {
@@ -75,7 +74,6 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
             let first: String = chars[..split_idx].iter().collect();
             lines.push(first.trim_end().to_string());
 
-            // lstrip on remainder
             let mut rest_start = split_idx;
             while rest_start < chars.len() && chars[rest_start].is_whitespace() {
                 rest_start += 1;
@@ -118,17 +116,14 @@ fn json_to_pretty_chat(data: &[Turn]) -> String {
 
         let max_inner_possible = if max_outer > 4 { max_outer - 4 } else { 1 };
 
-        // Truncate label if needed.
         let mut display_label = label.to_string();
         if char_len(&display_label) > max_inner_possible {
             let keep = max_inner_possible.saturating_sub(1);
             display_label = format!("{}…", take_chars(&display_label, keep));
         }
 
-        // Wrap the body.
         let wrapped_body = wrap(&body, max_inner_possible);
 
-        // Required inner width.
         let body_max_len = wrapped_body.iter().map(|l| char_len(l)).max().unwrap_or(0);
         let mut inner_width = char_len(&display_label).max(body_max_len);
 
@@ -141,7 +136,6 @@ fn json_to_pretty_chat(data: &[Turn]) -> String {
             }
         }
 
-        // Build the bubble.
         let dash = "─".repeat(w.saturating_sub(2));
         let mut bubble: Vec<String> = Vec::new();
 
@@ -153,7 +147,6 @@ fn json_to_pretty_chat(data: &[Turn]) -> String {
         }
         bubble.push(format!("╰{}╯", dash));
 
-        // Alignment.
         let left_pad = if side == "right" {
             width.saturating_sub(w)
         } else {
@@ -197,15 +190,9 @@ fn try_spawn_pager(text: &str) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    // (executable, extra_args)
-    // less  — Unix, Git-for-Windows, Scoop/Chocolatey, etc.
-    //         -R keeps ANSI colour codes intact.
-    // more  — built-in on both Windows (more.com) and Unix.
-    //         Does not understand -R, so no extra flags.
     let mut candidates: Vec<(String, Vec<&'static str>)> = Vec::new();
 
     if let Ok(p) = std::env::var("PAGER") {
-        // Honour whatever the user set; no extra flags assumed.
         candidates.push((p, vec![]));
     }
     candidates.push(("less".into(), vec!["-R"]));
@@ -217,7 +204,6 @@ fn try_spawn_pager(text: &str) -> bool {
 
         if let Ok(mut child) = cmd.spawn() {
             if let Some(mut stdin) = child.stdin.take() {
-                // Ignore broken-pipe: user may have quit the pager early.
                 let _ = stdin.write_all(text.as_bytes());
             }
             let _ = child.wait();
@@ -227,34 +213,170 @@ fn try_spawn_pager(text: &str) -> bool {
     false
 }
 
-/// Simple built-in fallback: page by terminal height, prompt between pages.
+// ─── built-in less-like pager ────────────────────────────────────────────────
+
+/// Render one screenful plus the status bar.
+/// `out` must already be in raw mode.
+fn page_draw(
+    out: &mut std::io::Stdout,
+    lines: &[&str],
+    offset: usize,
+    term_w: usize,
+    term_h: usize,
+) {
+    use crossterm::{
+        cursor,
+        execute,
+        terminal::{Clear, ClearType},
+    };
+    use std::io::Write;
+
+    // Reserve the last row for the status bar.
+    let ph = term_h.saturating_sub(1);
+    let total = lines.len();
+    let end = (offset + ph).min(total);
+
+    execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0)).unwrap();
+
+    for line in &lines[offset..end] {
+        // Raw mode: \n does NOT imply \r, so we write \r\n explicitly.
+        write!(out, "{}\r\n", line).unwrap();
+    }
+
+    // ── Status bar ───────────────────────────────────────────────────────────
+    let pct = if total == 0 { 100 } else { end * 100 / total };
+    let at_end = end >= total;
+
+    let status = format!(
+        " {first}-{last}/{total} ({pct}%){end_marker}\
+         \u{2502} q:quit  \u{2191}\u{2193}/jk:line  PgUp/PgDn:page  g/G:top/bot ",
+        first     = if total == 0 { 0 } else { offset + 1 },
+        last      = end,
+        total     = total,
+        pct       = pct,
+        end_marker = if at_end { " END " } else { " " },
+    );
+
+    // Pad to terminal width, then hard-truncate so we never wrap.
+    let bar: String = format!("{:<width$}", status, width = term_w)
+        .chars()
+        .take(term_w)
+        .collect();
+
+    execute!(out, cursor::MoveTo(0, ph as u16)).unwrap();
+    // Reverse-video highlight for the status bar.
+    write!(out, "\x1b[7m{}\x1b[0m", bar).unwrap();
+
+    out.flush().unwrap();
+}
+
+/// Interactive less-like pager used when no external pager is available.
+///
+/// Keys
+/// ────
+/// q / Q / Ctrl-C   quit
+/// ↓  j  Enter      scroll one line down
+/// ↑  k             scroll one line up
+/// PgDn  Space  f   scroll one page down
+/// PgUp  b           scroll one page up
+/// g  Home           jump to top
+/// G  End            jump to bottom
 fn builtin_page(text: &str) {
-    use std::io::{BufRead, Write};
+    use crossterm::{
+        cursor,
+        event::{self, Event, KeyCode, KeyModifiers},
+        execute,
+        terminal::{self, ClearType},
+    };
+    use std::io::{stdout, Write};
 
-    let page_size = terminal_size()
-        .map(|(_, terminal_size::Height(h))| h as usize)
-        .unwrap_or(24)
-        .saturating_sub(1); // one line reserved for the prompt
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
 
-    let mut printed = 0usize;
+    terminal::enable_raw_mode().expect("failed to enable raw mode");
+    let mut out = stdout();
 
-    for line in text.lines() {
-        println!("{}", line);
-        printed += 1;
+    let (mut term_w, mut term_h) = terminal::size().unwrap_or((80, 24));
+    let mut offset: usize = 0;
 
-        if printed % page_size == 0 {
-            print!("--- more --- (Enter to continue, q + Enter to quit) ");
-            let _ = std::io::stdout().flush();
+    page_draw(&mut out, &lines, offset, term_w as usize, term_h as usize);
 
-            let mut input = String::new();
-            let _ = std::io::stdin().lock().read_line(&mut input);
+    loop {
+        match event::read().unwrap() {
+            // ── keyboard ─────────────────────────────────────────────────────
+            Event::Key(key) => {
+                let ph = (term_h as usize).saturating_sub(1);
 
-            if input.trim().eq_ignore_ascii_case("q") {
-                break;
+                match key.code {
+                    // Quit
+                    KeyCode::Char('q') | KeyCode::Char('Q') => break,
+                    KeyCode::Char('c')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        break
+                    }
+
+                    // Scroll one line down
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => {
+                        if offset + ph < total {
+                            offset += 1;
+                        }
+                    }
+
+                    // Scroll one line up
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        offset = offset.saturating_sub(1);
+                    }
+
+                    // Scroll one page down
+                    KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
+                        offset = offset
+                            .saturating_add(ph)
+                            .min(total.saturating_sub(ph));
+                    }
+
+                    // Scroll one page up
+                    KeyCode::PageUp | KeyCode::Char('b') => {
+                        offset = offset.saturating_sub(ph);
+                    }
+
+                    // Jump to top
+                    KeyCode::Home | KeyCode::Char('g') => offset = 0,
+
+                    // Jump to bottom
+                    KeyCode::End | KeyCode::Char('G') => {
+                        offset = total.saturating_sub(ph);
+                    }
+
+                    _ => continue, // unrecognised key → no redraw
+                }
+
+                page_draw(&mut out, &lines, offset, term_w as usize, term_h as usize);
             }
+
+            // ── terminal resize ───────────────────────────────────────────────
+            Event::Resize(w, h) => {
+                term_w = w;
+                term_h = h;
+                let ph = (h as usize).saturating_sub(1);
+                // Keep offset sane after resize.
+                offset = offset.min(total.saturating_sub(ph));
+                page_draw(&mut out, &lines, offset, term_w as usize, term_h as usize);
+            }
+
+            _ => {}
         }
     }
+
+    // Restore terminal state and clear the screen before returning.
+    terminal::disable_raw_mode().expect("failed to disable raw mode");
+    execute!(out, ClearType::All, cursor::MoveTo(0, 0)).ok();
+    execute!(out, crossterm::terminal::Clear(ClearType::All), cursor::MoveTo(0, 0)).unwrap();
+    out.flush().unwrap();
 }
+
+// ─── entry point ─────────────────────────────────────────────────────────────
+
 fn main() -> ExitCode {
     let args = Args::parse();
     match load_json(&args.input) {
