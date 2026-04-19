@@ -1,6 +1,6 @@
 [package]
 name        = "jtt"
-version     = "0.1.0"
+version     = "0.1.1"
 edition     = "2021"
 description = "Pretty-print JSON chat logs as left/right terminal bubbles with a built-in pager."
 license     = "MIT"
