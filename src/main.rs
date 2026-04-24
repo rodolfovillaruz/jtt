@@ -42,7 +42,6 @@ fn term_width() -> usize {
 }
 
 /// Returns the number of **terminal columns** a string occupies.
-/// Emoji and CJK characters count as 2; control chars as 0.
 fn display_width(s: &str) -> usize {
     s.width()
 }
@@ -60,7 +59,6 @@ fn pad_right(s: &str, width: usize) -> String {
 }
 
 /// Take characters from `s` until the accumulated column count would exceed `cols`.
-/// Stops before a wide character that would overflow.
 fn take_cols(s: &str, cols: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -89,11 +87,9 @@ fn wrap(text: &str, cols: usize) -> Vec<String> {
                 break;
             }
 
-            // Walk forward, tracking column position.
-            // Record the byte index of the last space that still fits.
             let mut col: usize = 0;
-            let mut last_space: Option<usize> = None; // byte index of space
-            let mut hard_cut: usize = remaining.len(); // fallback: cut here
+            let mut last_space: Option<usize> = None;
+            let mut hard_cut: usize = remaining.len();
 
             for (byte_idx, ch) in remaining.char_indices() {
                 let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
@@ -108,7 +104,6 @@ fn wrap(text: &str, cols: usize) -> Vec<String> {
             }
 
             let split_at = last_space.unwrap_or(hard_cut);
-
             lines.push(remaining[..split_at].trim_end().to_string());
             remaining = remaining[split_at..].trim_start_matches(' ');
         }
@@ -119,13 +114,13 @@ fn wrap(text: &str, cols: usize) -> Vec<String> {
 
 // ─── Chat renderer ───────────────────────────────────────────────────────────
 
-fn json_to_pretty_chat(data: &[Turn]) -> String {
+/// Render turns into individual display lines using the given terminal width.
+/// Called once at startup and again every time the terminal is resized.
+fn render_lines(data: &[Turn], width: usize) -> Vec<String> {
     let user_label = "You";
     let assistant_label = "Assistant";
 
-    let width = term_width();
     let bubble_max_width = width * 75 / 100;
-
     let mut lines: Vec<String> = Vec::new();
 
     for turn in data {
@@ -145,19 +140,16 @@ fn json_to_pretty_chat(data: &[Turn]) -> String {
             _ => ("left", bubble_max_width),
         };
 
-        // ╭──…──╮  →  2 border chars + 2 spaces + inner
         let max_inner_possible = if max_outer > 4 { max_outer - 4 } else { 1 };
 
-        // Truncate label if it is too wide.
         let mut display_label = label.to_string();
         if display_width(&display_label) > max_inner_possible {
-            let keep = max_inner_possible.saturating_sub(1); // leave room for "…"
+            let keep = max_inner_possible.saturating_sub(1);
             display_label = format!("{}…", take_cols(&display_label, keep));
         }
 
         let wrapped_body = wrap(&body, max_inner_possible);
 
-        // Inner width = widest of (label, body lines), capped at max_inner_possible.
         let body_max = wrapped_body
             .iter()
             .map(|l| display_width(l))
@@ -198,7 +190,11 @@ fn json_to_pretty_chat(data: &[Turn]) -> String {
         lines.push(String::new());
     }
 
-    lines.join("\n")
+    lines
+}
+
+fn json_to_pretty_chat(data: &[Turn]) -> String {
+    render_lines(data, term_width()).join("\n")
 }
 
 // ─── JSON loader ─────────────────────────────────────────────────────────────
@@ -215,7 +211,7 @@ fn load_json(path: &PathBuf) -> Result<Vec<Turn>, Box<dyn std::error::Error>> {
 
 // ─── Ratatui pager ───────────────────────────────────────────────────────────
 
-fn ratatui_page(text: &str) {
+fn ratatui_page(turns: &[Turn]) {
     use crossterm::{
         event::{self, Event, KeyCode, KeyModifiers},
         execute,
@@ -223,7 +219,7 @@ fn ratatui_page(text: &str) {
     };
     use ratatui::{
         backend::CrosstermBackend,
-        layout::Rect,
+        layout::{Rect, Size},
         style::{Modifier, Style},
         text::{Line, Text},
         widgets::Paragraph,
@@ -231,15 +227,20 @@ fn ratatui_page(text: &str) {
     };
     use std::io::stdout;
 
-    let lines: Vec<&str> = text.lines().collect();
-    let total = lines.len();
-    let mut offset: usize = 0;
-
     terminal::enable_raw_mode().expect("enable raw mode");
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen).expect("enter alternate screen");
     let mut terminal =
         Terminal::new(CrosstermBackend::new(stdout)).expect("create ratatui terminal");
+
+    // Render at the actual initial terminal width reported by the backend.
+    let initial_size = terminal.size().unwrap_or(Size {
+        width: 80,
+        height: 24,
+    });
+    let mut lines = render_lines(turns, initial_size.width as usize);
+    let mut total = lines.len();
+    let mut offset: usize = 0;
 
     loop {
         terminal
@@ -257,7 +258,7 @@ fn ratatui_page(text: &str) {
                 let visible = Text::from(
                     lines[offset..end]
                         .iter()
-                        .map(|l| Line::raw(*l))
+                        .map(|l| Line::raw(l.as_str()))
                         .collect::<Vec<_>>(),
                 );
                 frame.render_widget(Paragraph::new(visible), content_rect);
@@ -316,10 +317,24 @@ fn ratatui_page(text: &str) {
                     _ => {}
                 }
             }
-            Event::Resize(_, h) => {
-                let ph = (h as usize).saturating_sub(1);
-                offset = offset.min(total.saturating_sub(ph));
+
+            Event::Resize(new_w, new_h) => {
+                // Re-wrap all bubbles at the new terminal width.
+                // Preserve the fractional scroll position so the user
+                // stays roughly at the same place in the conversation.
+                let frac = if total > 0 {
+                    offset as f64 / total as f64
+                } else {
+                    0.0
+                };
+
+                lines = render_lines(turns, new_w as usize);
+                total = lines.len();
+
+                let ph = (new_h as usize).saturating_sub(1);
+                offset = ((frac * total as f64) as usize).min(total.saturating_sub(ph));
             }
+
             _ => {}
         }
     }
@@ -331,12 +346,13 @@ fn ratatui_page(text: &str) {
 
 // ─── Output dispatcher ───────────────────────────────────────────────────────
 
-fn page_output(text: &str) {
+fn page_output(text: &str, turns: &[Turn]) {
     if !std::io::stdout().is_terminal() {
+        // Piped / redirected — just emit the pre-rendered text.
         print!("{}", text);
         return;
     }
-    ratatui_page(text);
+    ratatui_page(turns);
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -345,8 +361,9 @@ fn main() -> ExitCode {
     let args = Args::parse();
     match load_json(&args.input) {
         Ok(chat) => {
+            // Render once for the non-terminal (pipe) path.
             let output = json_to_pretty_chat(&chat);
-            page_output(&output);
+            page_output(&output, &chat);
             ExitCode::from(0)
         }
         Err(e) => {
