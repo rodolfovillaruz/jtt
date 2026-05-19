@@ -271,8 +271,8 @@ fn ratatui_page(text: &str) {
                 let pct = if total == 0 { 100 } else { end * 100 / total };
                 let status = format!(
                     " {first}–{last}/{total} ({pct}%){end_marker}\
-                     \u{2502} q:quit  \u{2191}\u{2193}/jk:line  \
-                     PgUp/PgDn:page  g/G:top/bot ",
+     \u{2502} q:quit  \u{2191}\u{2193}/jk:line  \
+     PgUp/PgDn/Ctrl+\u{2191}\u{2193}:page  g/G:top/bot ",
                     first = if total == 0 { 0 } else { offset + 1 },
                     last = end,
                     total = total,
@@ -295,10 +295,16 @@ fn ratatui_page(text: &str) {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        offset = (offset + ph).min(total.saturating_sub(ph));
+                    }
                     KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => {
                         if offset + ph < total {
                             offset += 1;
                         }
+                    }
+                    KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        offset = offset.saturating_sub(ph);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         offset = offset.saturating_sub(1);
