@@ -217,7 +217,10 @@ fn load_json(path: &PathBuf) -> Result<Vec<Turn>, Box<dyn std::error::Error>> {
 
 fn ratatui_page(text: &str) {
     use crossterm::{
-        event::{self, Event, KeyCode, KeyModifiers},
+        event::{
+            self, Event, KeyCode, KeyModifiers, KeyboardEnhancementFlags,
+            PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        },
         execute,
         terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
     };
@@ -238,6 +241,14 @@ fn ratatui_page(text: &str) {
     terminal::enable_raw_mode().expect("enable raw mode");
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen).expect("enter alternate screen");
+
+    // Try to enable modifier reporting; not all terminals support it.
+    let enhancement_pushed = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok();
+
     let mut terminal =
         Terminal::new(CrosstermBackend::new(stdout)).expect("create ratatui terminal");
 
@@ -271,8 +282,8 @@ fn ratatui_page(text: &str) {
                 let pct = if total == 0 { 100 } else { end * 100 / total };
                 let status = format!(
                     " {first}–{last}/{total} ({pct}%){end_marker}\
-     \u{2502} q:quit  \u{2191}\u{2193}/jk:line  \
-     PgUp/PgDn/Ctrl+\u{2191}\u{2193}:page  g/G:top/bot ",
+                     \u{2502} q:quit  \u{2191}\u{2193}/jk:line  \
+                     PgUp/PgDn/Ctrl+\u{2191}\u{2193}:page  g/G:top/bot ",
                     first = if total == 0 { 0 } else { offset + 1 },
                     last = end,
                     total = total,
@@ -331,6 +342,10 @@ fn ratatui_page(text: &str) {
     }
 
     terminal::disable_raw_mode().expect("disable raw mode");
+    if enhancement_pushed {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)
+            .expect("pop keyboard enhancement");
+    }
     execute!(terminal.backend_mut(), LeaveAlternateScreen).expect("leave alternate screen");
     terminal.show_cursor().expect("show cursor");
 }
