@@ -235,6 +235,14 @@ fn ratatui_page(text: &str) {
     let total = lines.len();
     let mut offset: usize = 0;
 
+    // ── Find all bubble‑top lines ─────────────────────────────────
+    let bubble_tops: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with('╭'))
+        .map(|(i, _)| i)
+        .collect();
+
     terminal::enable_raw_mode().expect("enable raw mode");
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen).expect("enter alternate screen");
@@ -295,6 +303,47 @@ fn ratatui_page(text: &str) {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+
+                    // ── Ctrl+PageDown: next bubble ──────────────────────────
+                    KeyCode::PageDown if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // find first bubble top strictly greater than current offset
+                        match bubble_tops.binary_search(&offset) {
+                            Ok(pos) => {
+                                // offset equals a bubble top – jump to the next one
+                                if pos + 1 < bubble_tops.len() {
+                                    offset = bubble_tops[pos + 1];
+                                }
+                            }
+                            Err(pos) => {
+                                // pos is the index of the first element > offset
+                                if pos < bubble_tops.len() {
+                                    offset = bubble_tops[pos];
+                                }
+                            }
+                        }
+                        // clamp to safe range (though it should already be OK)
+                        offset = offset.min(total.saturating_sub(ph));
+                    }
+
+                    // ── Ctrl+PageUp: previous bubble ─────────────────────────
+                    KeyCode::PageUp if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        match bubble_tops.binary_search(&offset) {
+                            Ok(pos) => {
+                                if pos > 0 {
+                                    offset = bubble_tops[pos - 1];
+                                }
+                            }
+                            Err(pos) => {
+                                // pos is the first element > offset,
+                                // so the previous bubble top is at pos-1
+                                if pos > 0 {
+                                    offset = bubble_tops[pos - 1];
+                                }
+                            }
+                        }
+                    }
+
+                    // existing navigation (unchanged)
                     KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         offset = (offset + ph).min(total.saturating_sub(ph));
                     }
