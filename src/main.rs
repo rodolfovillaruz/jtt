@@ -235,13 +235,23 @@ fn ratatui_page(text: &str) {
     let total = lines.len();
     let mut offset: usize = 0;
 
-    // ── Find all bubble‑top lines ─────────────────────────────────
+    // ── Find bubble boundaries ─────────────────────────────
     let bubble_tops: Vec<usize> = lines
         .iter()
         .enumerate()
         .filter(|(_, line)| line.trim_start().starts_with('╭'))
         .map(|(i, _)| i)
         .collect();
+
+    let bubble_bottoms: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with('╰'))
+        .map(|(i, _)| i)
+        .collect();
+
+    // Safety: every bottom must have a preceding top.
+    assert_eq!(bubble_tops.len(), bubble_bottoms.len());
 
     terminal::enable_raw_mode().expect("enable raw mode");
     let mut stdout = stdout();
@@ -359,9 +369,52 @@ fn ratatui_page(text: &str) {
                         offset = offset.saturating_sub(1);
                     }
                     KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
-                        offset = (offset + ph).min(total.saturating_sub(ph));
+                        let ph = terminal
+                            .size()
+                            .map(|s| (s.height as usize).saturating_sub(1))
+                            .unwrap_or(23);
+                        let target = (offset + ph).min(total.saturating_sub(ph));
+
+                        // Look for a bubble bottom that falls inside the new viewport.
+                        let mut new_offset = target;
+                        for (i, &bot) in bubble_bottoms.iter().enumerate() {
+                            if bot >= target && bot < target + ph {
+                                // The bottom of bubble i is visible → snap to the next bubble’s top.
+                                if i + 1 < bubble_tops.len() {
+                                    new_offset = bubble_tops[i + 1];
+                                }
+                                break;
+                            }
+                        }
+                        offset = new_offset.min(total.saturating_sub(ph));
                     }
                     KeyCode::PageUp | KeyCode::Char('b') => {
+                        let ph = terminal
+                            .size()
+                            .map(|s| (s.height as usize).saturating_sub(1))
+                            .unwrap_or(23);
+                        let target = offset.saturating_sub(ph);
+
+                        // Only snap if we actually page past a bubble top.
+                        // (Uncomment to enable backward snap.)
+                        /*
+                        let mut new_offset = target;
+                        for (i, &top) in bubble_tops.iter().enumerate() {
+                            if top >= target && top < target + ph {
+                                if i > 0 {
+                                    let prev_bot = bubble_bottoms[i - 1];
+                                    // Align previous bottom to the screen bottom.
+                                    new_offset = prev_bot.saturating_sub(ph.saturating_sub(1));
+                                    new_offset = new_offset.min(total.saturating_sub(ph));
+                                } else {
+                                    new_offset = 0;
+                                }
+                                break;
+                            }
+                        }
+                        offset = new_offset;
+                        */
+                        // Without snap, just page up as before.
                         offset = offset.saturating_sub(ph);
                     }
                     KeyCode::Home | KeyCode::Char('g') => offset = 0,
